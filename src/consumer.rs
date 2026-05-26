@@ -21,7 +21,7 @@ pub struct TransactionConsumer {
 }
 
 impl TransactionConsumer {
-    pub async fn new(
+    async fn new(
         source: Arc<dyn TransactionSource>,
         pool: Pool<Postgres>,
         options: TransactionConsumerOptions,
@@ -40,19 +40,6 @@ impl TransactionConsumer {
         options: TransactionConsumerOptions,
     ) -> Result<Self> {
         Self::new(Arc::new(JrpcClient::new(endpoint)), pool, options).await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_storage_for_tests(
-        source: Arc<dyn TransactionSource>,
-        storage: PostgresCursorStorage,
-        options: TransactionConsumerOptions,
-    ) -> Self {
-        Self {
-            source,
-            storage,
-            options,
-        }
     }
 
     pub async fn stream_transactions<I, A>(
@@ -186,6 +173,7 @@ async fn stream_account(
             cursor = AccountCursor {
                 last_transaction_lt: Some(transaction.prev_trans_lt),
                 synced: false,
+                updated_at: 0,
             };
             let (item, rx) = ConsumedTransaction::new(
                 account.clone(),

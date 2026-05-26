@@ -6,28 +6,39 @@ use tycho_types::models::StdAddr;
 const CREATE_CURSOR_TABLE: &str = r"
 CREATE TABLE IF NOT EXISTS transaction_consumer_cursors (
     account TEXT PRIMARY KEY,
-    last_transaction_lt BIGINT,
+    last_transaction_lt NUMERIC(20, 0),
     synced BOOLEAN NOT NULL DEFAULT FALSE,
-    updated_at BIGINT NOT NULL DEFAULT extract(epoch from (CURRENT_TIMESTAMP(3) at time zone 'utc')) * 1000,
+    updated_at BIGINT NOT NULL DEFAULT (
+        floor(extract(epoch FROM (CURRENT_TIMESTAMP(3) AT TIME ZONE 'utc')) * 1000)::bigint
+    ),
     CONSTRAINT transaction_consumer_cursors_last_transaction_lt_check
-        CHECK (last_transaction_lt IS NULL OR last_transaction_lt ~ '^[0-9]+$')
+        CHECK (
+            last_transaction_lt IS NULL
+            OR (
+                last_transaction_lt >= 0
+                AND last_transaction_lt <= 18446744073709551615
+            )
+        )
 )
 ";
 
 const SELECT_CURSOR: &str = r"
-SELECT last_transaction_lt, synced
+SELECT
+    last_transaction_lt::text AS last_transaction_lt,
+    synced,
+    updated_at
 FROM transaction_consumer_cursors
 WHERE account = $1
 ";
 
 const UPSERT_CURSOR: &str = r"
 INSERT INTO transaction_consumer_cursors (account, last_transaction_lt, synced)
-VALUES ($1, $2, $3)
+VALUES ($1, ($2::text)::numeric(20, 0), $3)
 ON CONFLICT (account) DO UPDATE
 SET
     last_transaction_lt = EXCLUDED.last_transaction_lt,
     synced = EXCLUDED.synced,
-    updated_at = extract(epoch from (CURRENT_TIMESTAMP(3) at time zone 'utc')) * 1000
+    updated_at = floor(extract(epoch FROM (CURRENT_TIMESTAMP(3) AT TIME ZONE 'utc')) * 1000)::bigint
 ";
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -35,6 +46,7 @@ SET
 pub struct AccountCursor {
     pub last_transaction_lt: Option<u64>,
     pub synced: bool,
+    pub updated_at: i64,
 }
 
 #[derive(Clone)]
@@ -76,6 +88,9 @@ impl PostgresCursorStorage {
         let synced = row
             .try_get("synced")
             .context("Failed to decode cursor sync state")?;
+        let updated_at = row
+            .try_get("updated_at")
+            .context("Failed to decode cursor update time")?;
 
         Ok(Some(AccountCursor {
             last_transaction_lt: last_transaction_lt
@@ -85,6 +100,7 @@ impl PostgresCursorStorage {
                 })
                 .transpose()?,
             synced,
+            updated_at,
         }))
     }
 
