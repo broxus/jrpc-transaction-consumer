@@ -10,6 +10,6 @@ futures = "0.3.32"
 reqwest = { version = "0.13.3", features = ["json", "gzip"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
-tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "sync"] }
+tokio = { version = "1.52.3", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1.44"
 tycho-types = "0.3.4"

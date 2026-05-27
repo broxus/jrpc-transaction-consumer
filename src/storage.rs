@@ -7,6 +7,7 @@ const CREATE_CURSOR_TABLE: &str = r"
 CREATE TABLE IF NOT EXISTS transaction_consumer_cursors (
     account TEXT PRIMARY KEY,
     last_transaction_lt NUMERIC(20, 0),
+    latest_transaction_lt NUMERIC(20, 0),
     synced BOOLEAN NOT NULL DEFAULT FALSE,
     updated_at BIGINT NOT NULL DEFAULT (
         floor(extract(epoch FROM (CURRENT_TIMESTAMP(3) AT TIME ZONE 'utc')) * 1000)::bigint
@@ -18,6 +19,14 @@ CREATE TABLE IF NOT EXISTS transaction_consumer_cursors (
                 last_transaction_lt >= 0
                 AND last_transaction_lt <= 18446744073709551615
             )
+        ),
+    CONSTRAINT transaction_consumer_cursors_latest_transaction_lt_check
+        CHECK (
+            latest_transaction_lt IS NULL
+            OR (
+                latest_transaction_lt >= 0
+                AND latest_transaction_lt <= 18446744073709551615
+            )
         )
 )
 ";
@@ -25,6 +34,7 @@ CREATE TABLE IF NOT EXISTS transaction_consumer_cursors (
 const SELECT_CURSOR: &str = r"
 SELECT
     last_transaction_lt::text AS last_transaction_lt,
+    latest_transaction_lt::text AS latest_transaction_lt,
     synced,
     updated_at
 FROM transaction_consumer_cursors
@@ -32,11 +42,12 @@ WHERE account = $1
 ";
 
 const UPSERT_CURSOR: &str = r"
-INSERT INTO transaction_consumer_cursors (account, last_transaction_lt, synced)
-VALUES ($1, ($2::text)::numeric(20, 0), $3)
+INSERT INTO transaction_consumer_cursors (account, last_transaction_lt, latest_transaction_lt, synced)
+VALUES ($1, ($2::text)::numeric(20, 0), ($3::text)::numeric(20, 0), $4)
 ON CONFLICT (account) DO UPDATE
 SET
     last_transaction_lt = EXCLUDED.last_transaction_lt,
+    latest_transaction_lt = EXCLUDED.latest_transaction_lt,
     synced = EXCLUDED.synced,
     updated_at = floor(extract(epoch FROM (CURRENT_TIMESTAMP(3) AT TIME ZONE 'utc')) * 1000)::bigint
 ";
@@ -45,6 +56,7 @@ SET
 #[serde(rename_all = "camelCase")]
 pub struct AccountCursor {
     pub last_transaction_lt: Option<u64>,
+    pub latest_transaction_lt: Option<u64>,
     pub synced: bool,
     pub updated_at: i64,
 }
@@ -85,6 +97,9 @@ impl PostgresCursorStorage {
         let last_transaction_lt: Option<String> = row
             .try_get("last_transaction_lt")
             .context("Failed to decode cursor lt")?;
+        let latest_transaction_lt: Option<String> = row
+            .try_get("latest_transaction_lt")
+            .context("Failed to decode latest cursor lt")?;
         let synced = row
             .try_get("synced")
             .context("Failed to decode cursor sync state")?;
@@ -93,12 +108,8 @@ impl PostgresCursorStorage {
             .context("Failed to decode cursor update time")?;
 
         Ok(Some(AccountCursor {
-            last_transaction_lt: last_transaction_lt
-                .map(|lt| {
-                    lt.parse::<u64>()
-                        .with_context(|| format!("Failed to parse cursor lt {lt}"))
-                })
-                .transpose()?,
+            last_transaction_lt: parse_optional_lt(last_transaction_lt, "cursor lt")?,
+            latest_transaction_lt: parse_optional_lt(latest_transaction_lt, "latest cursor lt")?,
             synced,
             updated_at,
         }))
@@ -113,10 +124,14 @@ impl PostgresCursorStorage {
         let last_transaction_lt = cursor
             .last_transaction_lt
             .map(|last_transaction_lt| format!("{last_transaction_lt}"));
+        let latest_transaction_lt = cursor
+            .latest_transaction_lt
+            .map(|latest_transaction_lt| format!("{latest_transaction_lt}"));
 
         sqlx::query(UPSERT_CURSOR)
             .bind(&account)
             .bind(last_transaction_lt)
+            .bind(latest_transaction_lt)
             .bind(cursor.synced)
             .execute(&self.pool)
             .await
@@ -124,4 +139,13 @@ impl PostgresCursorStorage {
 
         Ok(())
     }
+}
+
+fn parse_optional_lt(value: Option<String>, name: &str) -> Result<Option<u64>> {
+    value
+        .map(|lt| {
+            lt.parse::<u64>()
+                .with_context(|| format!("Failed to parse {name} {lt}"))
+        })
+        .transpose()
 }

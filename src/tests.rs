@@ -1,8 +1,8 @@
+use crate::{StartFrom, TransactionConsumer, TransactionConsumerOptions};
 use anyhow::Result;
 use futures::StreamExt;
 use sqlx::postgres::PgPoolOptions;
-
-use crate::{TransactionConsumer, TransactionConsumerOptions};
+use std::time::Duration;
 
 #[tokio::test]
 pub async fn transaction_test() -> Result<()> {
@@ -15,23 +15,39 @@ pub async fn transaction_test() -> Result<()> {
     let consumer = TransactionConsumer::from_jrpc(
         "https://jrpc.venom.foundation",
         pool,
-        TransactionConsumerOptions::default(),
+        TransactionConsumerOptions {
+            start_from: StartFrom::Beginning,
+            batch_size: 100,
+            realtime_poll_interval: Duration::from_secs(1),
+        },
     )
     .await?;
     let stream = consumer
         .stream_transactions(vec![
-            "0:c786613a020cc55913022edeeedd96ebd7de91174cdb94ca92f7af88c910c686",
-            "0:91bb611575285d48eed3385e3184fc502cd3bb4a54938b0759d9d8c804e96e28",
+            "0:7094fc3cb69fa1b7bde8e830e2cd74bc9455d93561ce2c562182215686eb45e2",
+            "0:8268a0771fb1fc016d475446ba4b87ca7fbb0db76480d4991216ea7586ddb889",
         ])
         .await?;
     futures::pin_mut!(stream);
+    let mut count = 0;
+
     while let Some(consumed) = stream.next().await {
         let consumed = consumed?;
+
         println!(
             "{} {}",
-            consumed.account, consumed.transaction.prev_trans_lt
+            consumed.account, consumed.transaction.prev_trans_lt,
         );
+
+        println!("{:?}", consumed.transaction);
+
         consumed.commit().await?;
+        count += 1;
+
+        if count >= 4 {
+            break;
+        }
     }
+
     Ok(())
 }
