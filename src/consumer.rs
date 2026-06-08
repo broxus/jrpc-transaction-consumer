@@ -162,10 +162,19 @@ async fn sync_account(
     }
 
     loop {
-        let transactions = source
-            .get_transactions(&account, cursor.last_transaction_lt, limit)
-            .await
-            .with_context(|| format!("Failed to fetch transactions for {account}"))?;
+        let Some(transactions) = get_transactions_with_retry(
+            source.clone(),
+            &account,
+            cursor.last_transaction_lt,
+            limit,
+            options.realtime_poll_interval,
+            "sync",
+            tx,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
 
         if transactions.is_empty() {
             cursor.synced = true;
@@ -177,8 +186,10 @@ async fn sync_account(
             return Ok(Some(cursor));
         }
 
-        for boc in transactions {
-            let fetched = decode_transaction(&account, boc)?;
+        'transactions: for boc in transactions {
+            let Some(fetched) = decode_transaction_or_skip(&account, boc) else {
+                continue 'transactions;
+            };
             let latest_transaction_lt = cursor
                 .latest_transaction_lt
                 .or(Some(fetched.transaction.lt));
@@ -222,6 +233,7 @@ async fn listen_realtime_account(
             source.clone(),
             storage.clone(),
             limit,
+            realtime_poll_interval,
             &mut subscription,
             tx,
         )
@@ -244,6 +256,7 @@ async fn poll_realtime_account(
     source: Arc<dyn TransactionSource>,
     storage: PostgresCursorStorage,
     limit: u8,
+    retry_interval: std::time::Duration,
     subscription: &mut AccountSubscription,
     tx: &mut mpsc::Sender<Result<ConsumedTransaction>>,
 ) -> Result<bool> {
@@ -252,8 +265,13 @@ async fn poll_realtime_account(
         &subscription.account,
         subscription.cursor.latest_transaction_lt,
         limit,
+        retry_interval,
+        tx,
     )
     .await?;
+    let Some(transactions) = transactions else {
+        return Ok(false);
+    };
 
     for fetched in transactions {
         let next_cursor = AccountCursor {
@@ -289,15 +307,26 @@ async fn collect_realtime_transactions(
     account: &StdAddr,
     latest_transaction_lt: Option<u64>,
     limit: u8,
-) -> Result<Vec<FetchedTransaction>> {
+    retry_interval: std::time::Duration,
+    tx: &mpsc::Sender<Result<ConsumedTransaction>>,
+) -> Result<Option<Vec<FetchedTransaction>>> {
     let mut last_transaction_lt = None;
     let mut transactions = Vec::new();
 
     loop {
-        let page = source
-            .get_transactions(account, last_transaction_lt, limit)
-            .await
-            .with_context(|| format!("Failed to fetch realtime transactions for {account}"))?;
+        let Some(page) = get_transactions_with_retry(
+            source.clone(),
+            account,
+            last_transaction_lt,
+            limit,
+            retry_interval,
+            "realtime",
+            tx,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
 
         if page.is_empty() {
             break;
@@ -307,7 +336,9 @@ async fn collect_realtime_transactions(
         let mut page_last_transaction_lt = None;
 
         for boc in page {
-            let fetched = decode_transaction(account, boc)?;
+            let Some(fetched) = decode_transaction_or_skip(account, boc) else {
+                continue;
+            };
             page_last_transaction_lt = Some(fetched.transaction.prev_trans_lt);
 
             if Some(fetched.transaction.lt) == latest_transaction_lt {
@@ -330,7 +361,57 @@ async fn collect_realtime_transactions(
     }
 
     transactions.reverse();
-    Ok(transactions)
+    Ok(Some(transactions))
+}
+
+async fn get_transactions_with_retry(
+    source: Arc<dyn TransactionSource>,
+    account: &StdAddr,
+    last_transaction_lt: Option<u64>,
+    limit: u8,
+    retry_interval: std::time::Duration,
+    phase: &'static str,
+    tx: &mpsc::Sender<Result<ConsumedTransaction>>,
+) -> Option<Vec<String>> {
+    let retry_interval = retry_interval.saturating_mul(3);
+
+    loop {
+        if tx.is_closed() {
+            return None;
+        }
+
+        match source
+            .get_transactions(account, last_transaction_lt, limit)
+            .await
+        {
+            Ok(transactions) => return Some(transactions),
+            Err(e) => {
+                tracing::warn!(
+                    phase,
+                    account = %account,
+                    ?last_transaction_lt,
+                    limit,
+                    error = ?e,
+                    "failed to fetch transactions; retrying"
+                );
+                tokio::time::sleep(retry_interval).await;
+            }
+        }
+    }
+}
+
+fn decode_transaction_or_skip(account: &StdAddr, boc: String) -> Option<FetchedTransaction> {
+    match decode_transaction(account, boc) {
+        Ok(fetched) => Some(fetched),
+        Err(e) => {
+            tracing::warn!(
+                account = %account,
+                error = ?e,
+                "bad transaction; skipping"
+            );
+            None
+        }
+    }
 }
 
 fn decode_transaction(account: &StdAddr, boc: String) -> Result<FetchedTransaction> {
